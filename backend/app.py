@@ -57,7 +57,7 @@ def get_revolut_account_uids():
 
 
 # ============================================================
-# UTILITAIRES TRANSACTIONS
+# UTILITAIRES
 # ============================================================
 
 def clean_amount(transaction):
@@ -103,8 +103,6 @@ def extract_balance(balances):
     if not balances:
         return 0.0
 
-    # On privilégie le solde disponible si Enable Banking
-    # renvoie plusieurs types de soldes.
     preferred_types = [
         "CLAV",
         "ITAV",
@@ -130,8 +128,75 @@ def extract_balance(balances):
 
     try:
         return float(balance_data.get("amount", 0))
+
     except (TypeError, ValueError):
         return 0.0
+
+
+# ============================================================
+# PAGINATION DES TRANSACTIONS
+# ============================================================
+
+def get_all_transactions(uid, headers, max_pages=20):
+    all_transactions = []
+
+    continuation_key = None
+    pages = 0
+
+    while pages < max_pages:
+        params = {}
+
+        if continuation_key:
+            params["continuation_key"] = continuation_key
+
+        response = requests.get(
+            f"{ENABLE_BANKING_API}/accounts/{uid}/transactions",
+            headers=headers,
+            params=params,
+            timeout=30,
+        )
+
+        if response.status_code != 200:
+            return {
+                "ok": False,
+                "http_status": response.status_code,
+                "transactions": all_transactions,
+                "pages": pages,
+                "has_more": False,
+            }
+
+        data = response.json()
+
+        transactions = data.get(
+            "transactions",
+            [],
+        )
+
+        all_transactions.extend(transactions)
+
+        pages += 1
+
+        new_continuation_key = data.get(
+            "continuation_key"
+        )
+
+        if not new_continuation_key:
+            continuation_key = None
+            break
+
+        # Protection contre une boucle infinie
+        if new_continuation_key == continuation_key:
+            continuation_key = None
+            break
+
+        continuation_key = new_continuation_key
+
+    return {
+        "ok": True,
+        "transactions": all_transactions,
+        "pages": pages,
+        "has_more": continuation_key is not None,
+    }
 
 
 # ============================================================
@@ -154,14 +219,19 @@ def health():
 
 
 # ============================================================
-# TEST ENABLE BANKING
+# STATUS ENABLE BANKING
 # ============================================================
 
 @app.get("/enable-banking/status")
 def enable_banking_status():
     try:
-        app_id = os.environ.get("ENABLE_BANKING_APP_ID")
-        key_b64 = os.environ.get("ENABLE_BANKING_PRIVATE_KEY_B64")
+        app_id = os.environ.get(
+            "ENABLE_BANKING_APP_ID"
+        )
+
+        key_b64 = os.environ.get(
+            "ENABLE_BANKING_PRIVATE_KEY_B64"
+        )
 
         if not app_id:
             return jsonify({
@@ -190,7 +260,9 @@ def enable_banking_status():
 
         try:
             now = int(
-                datetime.now(timezone.utc).timestamp()
+                datetime.now(
+                    timezone.utc
+                ).timestamp()
             )
 
             token = jwt.encode(
@@ -257,7 +329,7 @@ def enable_banking_status():
 
 
 # ============================================================
-# COMPTES REVOLUT
+# LISTE DES COMPTES REVOLUT
 # ============================================================
 
 @app.get("/revolut/accounts")
@@ -322,25 +394,24 @@ def revolut_data():
 
         for uid in account_uids:
 
-            # Informations du compte
+            # DETAILS
             details_response = requests.get(
                 f"{ENABLE_BANKING_API}/accounts/{uid}/details",
                 headers=headers,
                 timeout=30,
             )
 
-            # Soldes
+            # SOLDES
             balances_response = requests.get(
                 f"{ENABLE_BANKING_API}/accounts/{uid}/balances",
                 headers=headers,
                 timeout=30,
             )
 
-            # Transactions
-            transactions_response = requests.get(
-                f"{ENABLE_BANKING_API}/accounts/{uid}/transactions",
-                headers=headers,
-                timeout=30,
+            # TRANSACTIONS
+            transaction_result = get_all_transactions(
+                uid,
+                headers,
             )
 
             if details_response.status_code == 200:
@@ -356,37 +427,39 @@ def revolut_data():
             else:
                 balances = []
 
-            if transactions_response.status_code == 200:
-                transaction_data = (
-                    transactions_response.json()
-                )
-
-                transactions = transaction_data.get(
-                    "transactions",
-                    [],
-                )
-
-                continuation_key = transaction_data.get(
-                    "continuation_key"
-                )
-
-            else:
-                transactions = []
-                continuation_key = None
+            transactions = transaction_result.get(
+                "transactions",
+                [],
+            )
 
             accounts.append({
                 "name": details.get("name"),
-                "type": details.get("cash_account_type"),
+                "type": details.get(
+                    "cash_account_type"
+                ),
                 "currency": details.get("currency"),
                 "balances": balances,
                 "transactions": transactions,
-                "transaction_count": len(transactions),
-                "continuation_key": continuation_key,
+                "transaction_count": len(
+                    transactions
+                ),
+                "pages_loaded": transaction_result.get(
+                    "pages",
+                    0,
+                ),
+                "has_more": transaction_result.get(
+                    "has_more",
+                    False,
+                ),
                 "http": {
                     "details": details_response.status_code,
                     "balances": balances_response.status_code,
                     "transactions": (
-                        transactions_response.status_code
+                        200
+                        if transaction_result.get("ok")
+                        else transaction_result.get(
+                            "http_status"
+                        )
                     ),
                 },
             })
@@ -395,6 +468,114 @@ def revolut_data():
             "connected": True,
             "account_count": len(accounts),
             "accounts": accounts,
+        })
+
+    except Exception as exc:
+        return jsonify({
+            "connected": False,
+            "error": type(exc).__name__,
+        }), 500
+
+
+# ============================================================
+# TOUTES LES TRANSACTIONS REVOLUT
+# ============================================================
+
+@app.get("/revolut/transactions")
+def revolut_transactions():
+    try:
+        headers = create_enable_banking_headers()
+
+        account_uids = get_revolut_account_uids()
+
+        result = []
+
+        total_pages = 0
+        has_more = False
+
+        for uid in account_uids:
+
+            details_response = requests.get(
+                f"{ENABLE_BANKING_API}/accounts/{uid}/details",
+                headers=headers,
+                timeout=30,
+            )
+
+            if details_response.status_code == 200:
+                details = details_response.json()
+            else:
+                details = {}
+
+            transaction_result = get_all_transactions(
+                uid,
+                headers,
+            )
+
+            total_pages += transaction_result.get(
+                "pages",
+                0,
+            )
+
+            if transaction_result.get("has_more"):
+                has_more = True
+
+            transactions = transaction_result.get(
+                "transactions",
+                [],
+            )
+
+            for transaction in transactions:
+
+                amount_data = (
+                    transaction.get(
+                        "transaction_amount"
+                    )
+                    or {}
+                )
+
+                result.append({
+                    "account_type": details.get(
+                        "cash_account_type"
+                    ),
+                    "date": (
+                        transaction.get("booking_date")
+                        or transaction.get("value_date")
+                        or transaction.get(
+                            "transaction_date"
+                        )
+                    ),
+                    "merchant": transaction_name(
+                        transaction
+                    ),
+                    "amount": clean_amount(
+                        transaction
+                    ),
+                    "currency": amount_data.get(
+                        "currency",
+                        "EUR",
+                    ),
+                    "status": transaction.get(
+                        "status"
+                    ),
+                    "reference": transaction.get(
+                        "entry_reference"
+                    ),
+                })
+
+        # Plus récent en premier
+        result.sort(
+            key=lambda transaction: (
+                transaction.get("date") or ""
+            ),
+            reverse=True,
+        )
+
+        return jsonify({
+            "connected": True,
+            "transaction_count": len(result),
+            "pages_loaded": total_pages,
+            "has_more": has_more,
+            "transactions": result,
         })
 
     except Exception as exc:
@@ -425,10 +606,7 @@ def revolut_summary():
 
         for uid in account_uids:
 
-            # ------------------------------------------------
             # DETAILS
-            # ------------------------------------------------
-
             details_response = requests.get(
                 f"{ENABLE_BANKING_API}/accounts/{uid}/details",
                 headers=headers,
@@ -440,10 +618,7 @@ def revolut_summary():
             else:
                 details = {}
 
-            # ------------------------------------------------
-            # BALANCES
-            # ------------------------------------------------
-
+            # SOLDES
             balances_response = requests.get(
                 f"{ENABLE_BANKING_API}/accounts/{uid}/balances",
                 headers=headers,
@@ -458,12 +633,19 @@ def revolut_summary():
             else:
                 balances = []
 
-            balance = extract_balance(balances)
+            balance = extract_balance(
+                balances
+            )
 
             result["accounts"].append({
                 "name": details.get("name"),
-                "type": details.get("cash_account_type"),
-                "balance": round(balance, 2),
+                "type": details.get(
+                    "cash_account_type"
+                ),
+                "balance": round(
+                    balance,
+                    2,
+                ),
                 "currency": details.get(
                     "currency",
                     "EUR",
@@ -472,78 +654,63 @@ def revolut_summary():
 
             result["total_balance"] += balance
 
-            # ------------------------------------------------
-            # TRANSACTIONS
-            # ------------------------------------------------
-
-            transactions_response = requests.get(
-                f"{ENABLE_BANKING_API}/accounts/{uid}/transactions",
-                headers=headers,
-                timeout=30,
+            # TOUTES LES TRANSACTIONS
+            transaction_result = get_all_transactions(
+                uid,
+                headers,
             )
 
-            if transactions_response.status_code == 200:
-                transaction_data = (
-                    transactions_response.json()
+            transactions = transaction_result.get(
+                "transactions",
+                [],
+            )
+
+            for transaction in transactions:
+
+                amount_data = (
+                    transaction.get(
+                        "transaction_amount"
+                    )
+                    or {}
                 )
 
-                transactions = transaction_data.get(
-                    "transactions",
-                    [],
+                date = (
+                    transaction.get("booking_date")
+                    or transaction.get("value_date")
+                    or transaction.get(
+                        "transaction_date"
+                    )
                 )
 
-                for transaction in transactions:
+                result[
+                    "recent_transactions"
+                ].append({
+                    "date": date,
+                    "merchant": transaction_name(
+                        transaction
+                    ),
+                    "amount": clean_amount(
+                        transaction
+                    ),
+                    "currency": amount_data.get(
+                        "currency",
+                        "EUR",
+                    ),
+                    "status": transaction.get(
+                        "status"
+                    ),
+                    "reference": transaction.get(
+                        "entry_reference"
+                    ),
+                })
 
-                    date = (
-                        transaction.get("booking_date")
-                        or transaction.get("value_date")
-                        or transaction.get(
-                            "transaction_date"
-                        )
-                    )
-
-                    amount_data = (
-                        transaction.get(
-                            "transaction_amount"
-                        )
-                        or {}
-                    )
-
-                    result[
-                        "recent_transactions"
-                    ].append({
-                        "date": date,
-                        "merchant": transaction_name(
-                            transaction
-                        ),
-                        "amount": clean_amount(
-                            transaction
-                        ),
-                        "currency": amount_data.get(
-                            "currency",
-                            "EUR",
-                        ),
-                        "status": transaction.get(
-                            "status"
-                        ),
-                        "reference": transaction.get(
-                            "entry_reference"
-                        ),
-                    })
-
-        # ----------------------------------------------------
-        # TOTAL
-        # ----------------------------------------------------
-
+        # TOTAL DES COMPTES
         result["total_balance"] = round(
             result["total_balance"],
             2,
         )
 
-        # ----------------------------------------------------
-        # TRI DES TRANSACTIONS
-        # ----------------------------------------------------
-
+        # PLUS RÉCENT EN PREMIER
         result["recent_transactions"].sort(
             key=lambda transaction: (
                 transaction.get("date") or ""
@@ -551,7 +718,7 @@ def revolut_summary():
             reverse=True,
         )
 
-        # Pour l'instant : 20 dernières opérations.
+        # SUMMARY = seulement les 20 dernières
         result["recent_transactions"] = (
             result["recent_transactions"][:20]
         )
@@ -566,7 +733,7 @@ def revolut_summary():
 
 
 # ============================================================
-# LANCEMENT LOCAL
+# LANCEMENT
 # ============================================================
 
 if __name__ == "__main__":
