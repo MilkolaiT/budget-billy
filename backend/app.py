@@ -52,20 +52,68 @@ def health():
 @app.get("/enable-banking/status")
 def enable_banking_status():
     try:
-        token = create_enable_banking_token()
+        app_id = os.environ.get("ENABLE_BANKING_APP_ID")
+        key_b64 = os.environ.get("ENABLE_BANKING_PRIVATE_KEY_B64")
 
-        response = requests.get(
-            f"{ENABLE_BANKING_API}/application",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-            },
-            timeout=30,
-        )
+        if not app_id:
+            return jsonify({"connected": False, "step": "app_id_missing"}), 500
+
+        if not key_b64:
+            return jsonify({"connected": False, "step": "private_key_missing"}), 500
+
+        try:
+            private_key = base64.b64decode(key_b64, validate=True)
+        except Exception as exc:
+            return jsonify({
+                "connected": False,
+                "step": "base64_decode",
+                "error": type(exc).__name__
+            }), 500
+
+        try:
+            now = int(datetime.now(timezone.utc).timestamp())
+
+            token = jwt.encode(
+                {
+                    "iss": "enablebanking.com",
+                    "aud": "api.enablebanking.com",
+                    "iat": now,
+                    "exp": now + 3600,
+                },
+                private_key,
+                algorithm="RS256",
+                headers={
+                    "typ": "JWT",
+                    "kid": app_id,
+                },
+            )
+        except Exception as exc:
+            return jsonify({
+                "connected": False,
+                "step": "jwt_encode",
+                "error": type(exc).__name__
+            }), 500
+
+        try:
+            response = requests.get(
+                "https://api.enablebanking.com/application",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                },
+                timeout=30,
+            )
+        except Exception as exc:
+            return jsonify({
+                "connected": False,
+                "step": "enable_banking_request",
+                "error": type(exc).__name__
+            }), 500
 
         if response.status_code != 200:
             return jsonify({
                 "connected": False,
+                "step": "enable_banking_response",
                 "http_status": response.status_code
             }), 502
 
@@ -81,6 +129,7 @@ def enable_banking_status():
     except Exception as exc:
         return jsonify({
             "connected": False,
+            "step": "unexpected",
             "error": type(exc).__name__
         }), 500
 
