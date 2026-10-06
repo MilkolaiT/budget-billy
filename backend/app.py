@@ -269,3 +269,142 @@ def revolut_data():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
+def clean_amount(transaction):
+    amount_data = transaction.get("transaction_amount") or {}
+    try:
+        amount = float(amount_data.get("amount", 0))
+    except (TypeError, ValueError):
+        amount = 0.0
+
+    # Enable Banking donne souvent un montant positif
+    # + l'indicateur DBIT/CRDT séparément.
+    indicator = transaction.get("credit_debit_indicator")
+
+    if indicator == "DBIT":
+        amount = -abs(amount)
+    elif indicator == "CRDT":
+        amount = abs(amount)
+
+    return round(amount, 2)
+
+
+def transaction_name(transaction):
+    # Paiement : on privilégie le créancier/commerçant
+    creditor = transaction.get("creditor") or {}
+    debtor = transaction.get("debtor") or {}
+
+    name = creditor.get("name") or debtor.get("name")
+
+    if name:
+        return name
+
+    remittance = transaction.get("remittance_information")
+
+    if isinstance(remittance, list) and remittance:
+        return str(remittance[0])
+
+    if isinstance(remittance, str) and remittance:
+        return remittance
+
+    return "Transaction"
+
+
+@app.route("/revolut/summary")
+def revolut_summary():
+    try:
+        # On réutilise exactement les comptes déjà configurés
+        # dans production_session.json.
+        with open("production_session.json", "r", encoding="utf-8") as f:
+            session = json.load(f)
+
+        accounts = session.get("accounts", [])
+
+        result = {
+            "connected": True,
+            "currency": "EUR",
+            "total_balance": 0.0,
+            "accounts": [],
+            "recent_transactions": []
+        }
+
+        for account in accounts:
+            uid = account["uid"]
+
+            balance_response = requests.get(
+                f"https://api.enablebanking.com/accounts/{uid}/balances",
+                headers=enable_banking_headers(),
+                timeout=30
+            )
+
+            transaction_response = requests.get(
+                f"https://api.enablebanking.com/accounts/{uid}/transactions",
+                headers=enable_banking_headers(),
+                timeout=30
+            )
+
+            balance = 0.0
+
+            if balance_response.ok:
+                balances = balance_response.json().get("balances", [])
+
+                if balances:
+                    balance_data = balances[0].get("balance_amount") or {}
+
+                    try:
+                        balance = float(balance_data.get("amount", 0))
+                    except (TypeError, ValueError):
+                        balance = 0.0
+
+            account_type = account.get("cash_account_type")
+
+            result["accounts"].append({
+                "name": account.get("name"),
+                "type": account_type,
+                "balance": round(balance, 2),
+                "currency": account.get("currency", "EUR")
+            })
+
+            result["total_balance"] += balance
+
+            if transaction_response.ok:
+                transactions = transaction_response.json().get(
+                    "transactions", []
+                )
+
+                for transaction in transactions:
+                    result["recent_transactions"].append({
+                        "date": (
+                            transaction.get("booking_date")
+                            or transaction.get("value_date")
+                            or transaction.get("transaction_date")
+                        ),
+                        "merchant": transaction_name(transaction),
+                        "amount": clean_amount(transaction),
+                        "currency": (
+                            transaction.get("transaction_amount") or {}
+                        ).get("currency", "EUR"),
+                        "status": transaction.get("status"),
+                        "reference": transaction.get("entry_reference")
+                    })
+
+        result["total_balance"] = round(result["total_balance"], 2)
+
+        # Plus récentes en premier
+        result["recent_transactions"].sort(
+            key=lambda x: x.get("date") or "",
+            reverse=True
+        )
+
+        # Pour l'instant on garde seulement les 20 dernières
+        result["recent_transactions"] = result[
+            "recent_transactions"
+        ][:20]
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({
+            "connected": False,
+            "error": type(e).__name__
+        }), 500
