@@ -182,6 +182,90 @@ def revolut_accounts():
             "error": type(exc).__name__
         }), 500
 
+@app.get("/revolut/data")
+def revolut_data():
+    try:
+        token = create_enable_banking_token()
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+
+        account_uids = [
+            os.environ["REVOLUT_ACCOUNT_1_UID"],
+            os.environ["REVOLUT_ACCOUNT_2_UID"],
+        ]
+
+        accounts = []
+
+        for uid in account_uids:
+            # Informations du compte
+            details_response = requests.get(
+                f"{ENABLE_BANKING_API}/accounts/{uid}/details",
+                headers=headers,
+                timeout=30,
+            )
+
+            # Soldes
+            balances_response = requests.get(
+                f"{ENABLE_BANKING_API}/accounts/{uid}/balances",
+                headers=headers,
+                timeout=30,
+            )
+
+            # Transactions
+            transactions_response = requests.get(
+                f"{ENABLE_BANKING_API}/accounts/{uid}/transactions",
+                headers=headers,
+                timeout=30,
+            )
+
+            if details_response.status_code == 200:
+                details = details_response.json()
+            else:
+                details = {}
+
+            if balances_response.status_code == 200:
+                balances = balances_response.json().get("balances", [])
+            else:
+                balances = []
+
+            if transactions_response.status_code == 200:
+                transaction_data = transactions_response.json()
+                transactions = transaction_data.get("transactions", [])
+                continuation_key = transaction_data.get("continuation_key")
+            else:
+                transactions = []
+                continuation_key = None
+
+            accounts.append({
+                "name": details.get("name"),
+                "type": details.get("cash_account_type"),
+                "currency": details.get("currency"),
+                "balances": balances,
+                "transactions": transactions,
+                "transaction_count": len(transactions),
+                "continuation_key": continuation_key,
+                "http": {
+                    "details": details_response.status_code,
+                    "balances": balances_response.status_code,
+                    "transactions": transactions_response.status_code,
+                },
+            })
+
+        return jsonify({
+            "connected": True,
+            "account_count": len(accounts),
+            "accounts": accounts,
+        })
+
+    except Exception as exc:
+        return jsonify({
+            "connected": False,
+            "error": type(exc).__name__,
+        }), 500
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
