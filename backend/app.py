@@ -133,6 +133,54 @@ def enable_banking_status():
             "error": type(exc).__name__
         }), 500
 
+@app.get("/revolut/accounts")
+def revolut_accounts():
+    try:
+        token = create_enable_banking_token()
+
+        account_uids = [
+            os.environ["REVOLUT_ACCOUNT_1_UID"],
+            os.environ["REVOLUT_ACCOUNT_2_UID"],
+        ]
+
+        results = []
+
+        for uid in account_uids:
+            response = requests.get(
+                f"{ENABLE_BANKING_API}/accounts/{uid}/details",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                },
+                timeout=30,
+            )
+
+            if response.status_code != 200:
+                results.append({
+                    "ok": False,
+                    "http_status": response.status_code
+                })
+                continue
+
+            data = response.json()
+
+            results.append({
+                "ok": True,
+                "name": data.get("name"),
+                "currency": data.get("currency"),
+                "cash_account_type": data.get("cash_account_type"),
+            })
+
+        return jsonify({
+            "connected": True,
+            "accounts": results
+        })
+
+    except Exception as exc:
+        return jsonify({
+            "connected": False,
+            "error": type(exc).__name__
+        }), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
