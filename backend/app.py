@@ -2,13 +2,19 @@ import os
 import base64
 import requests
 import jwt
+
 from datetime import datetime, timezone
 from flask import Flask, jsonify
+
 
 app = Flask(__name__)
 
 ENABLE_BANKING_API = "https://api.enablebanking.com"
 
+
+# ============================================================
+# ENABLE BANKING
+# ============================================================
 
 def create_enable_banking_token():
     app_id = os.environ["ENABLE_BANKING_APP_ID"]
@@ -34,20 +40,122 @@ def create_enable_banking_token():
     )
 
 
+def create_enable_banking_headers():
+    token = create_enable_banking_token()
+
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+
+def get_revolut_account_uids():
+    return [
+        os.environ["REVOLUT_ACCOUNT_1_UID"],
+        os.environ["REVOLUT_ACCOUNT_2_UID"],
+    ]
+
+
+# ============================================================
+# UTILITAIRES TRANSACTIONS
+# ============================================================
+
+def clean_amount(transaction):
+    amount_data = transaction.get("transaction_amount") or {}
+
+    try:
+        amount = float(amount_data.get("amount", 0))
+    except (TypeError, ValueError):
+        amount = 0.0
+
+    indicator = transaction.get("credit_debit_indicator")
+
+    if indicator == "DBIT":
+        amount = -abs(amount)
+
+    elif indicator == "CRDT":
+        amount = abs(amount)
+
+    return round(amount, 2)
+
+
+def transaction_name(transaction):
+    creditor = transaction.get("creditor") or {}
+    debtor = transaction.get("debtor") or {}
+
+    name = creditor.get("name") or debtor.get("name")
+
+    if name:
+        return name
+
+    remittance = transaction.get("remittance_information")
+
+    if isinstance(remittance, list) and remittance:
+        return str(remittance[0])
+
+    if isinstance(remittance, str) and remittance:
+        return remittance
+
+    return "Transaction"
+
+
+def extract_balance(balances):
+    if not balances:
+        return 0.0
+
+    # On privilégie le solde disponible si Enable Banking
+    # renvoie plusieurs types de soldes.
+    preferred_types = [
+        "CLAV",
+        "ITAV",
+        "CLBD",
+        "ITBD",
+    ]
+
+    selected_balance = None
+
+    for preferred_type in preferred_types:
+        for balance in balances:
+            if balance.get("balance_type") == preferred_type:
+                selected_balance = balance
+                break
+
+        if selected_balance:
+            break
+
+    if selected_balance is None:
+        selected_balance = balances[0]
+
+    balance_data = selected_balance.get("balance_amount") or {}
+
+    try:
+        return float(balance_data.get("amount", 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# ============================================================
+# ACCUEIL
+# ============================================================
+
 @app.get("/")
 def home():
     return jsonify({
         "service": "Budget Billy",
-        "status": "online"
+        "status": "online",
     })
 
 
 @app.get("/health")
 def health():
     return jsonify({
-        "status": "ok"
+        "status": "ok",
     })
 
+
+# ============================================================
+# TEST ENABLE BANKING
+# ============================================================
 
 @app.get("/enable-banking/status")
 def enable_banking_status():
@@ -56,22 +164,34 @@ def enable_banking_status():
         key_b64 = os.environ.get("ENABLE_BANKING_PRIVATE_KEY_B64")
 
         if not app_id:
-            return jsonify({"connected": False, "step": "app_id_missing"}), 500
+            return jsonify({
+                "connected": False,
+                "step": "app_id_missing",
+            }), 500
 
         if not key_b64:
-            return jsonify({"connected": False, "step": "private_key_missing"}), 500
+            return jsonify({
+                "connected": False,
+                "step": "private_key_missing",
+            }), 500
 
         try:
-            private_key = base64.b64decode(key_b64, validate=True)
+            private_key = base64.b64decode(
+                key_b64,
+                validate=True,
+            )
+
         except Exception as exc:
             return jsonify({
                 "connected": False,
                 "step": "base64_decode",
-                "error": type(exc).__name__
+                "error": type(exc).__name__,
             }), 500
 
         try:
-            now = int(datetime.now(timezone.utc).timestamp())
+            now = int(
+                datetime.now(timezone.utc).timestamp()
+            )
 
             token = jwt.encode(
                 {
@@ -87,34 +207,36 @@ def enable_banking_status():
                     "kid": app_id,
                 },
             )
+
         except Exception as exc:
             return jsonify({
                 "connected": False,
                 "step": "jwt_encode",
-                "error": type(exc).__name__
+                "error": type(exc).__name__,
             }), 500
 
         try:
             response = requests.get(
-                "https://api.enablebanking.com/application",
+                f"{ENABLE_BANKING_API}/application",
                 headers={
                     "Authorization": f"Bearer {token}",
                     "Accept": "application/json",
                 },
                 timeout=30,
             )
+
         except Exception as exc:
             return jsonify({
                 "connected": False,
                 "step": "enable_banking_request",
-                "error": type(exc).__name__
+                "error": type(exc).__name__,
             }), 500
 
         if response.status_code != 200:
             return jsonify({
                 "connected": False,
                 "step": "enable_banking_response",
-                "http_status": response.status_code
+                "http_status": response.status_code,
             }), 502
 
         data = response.json()
@@ -123,43 +245,43 @@ def enable_banking_status():
             "connected": True,
             "application": data.get("name"),
             "environment": data.get("environment"),
-            "services": data.get("services")
+            "services": data.get("services"),
         })
 
     except Exception as exc:
         return jsonify({
             "connected": False,
             "step": "unexpected",
-            "error": type(exc).__name__
+            "error": type(exc).__name__,
         }), 500
+
+
+# ============================================================
+# COMPTES REVOLUT
+# ============================================================
 
 @app.get("/revolut/accounts")
 def revolut_accounts():
     try:
-        token = create_enable_banking_token()
+        headers = create_enable_banking_headers()
 
-        account_uids = [
-            os.environ["REVOLUT_ACCOUNT_1_UID"],
-            os.environ["REVOLUT_ACCOUNT_2_UID"],
-        ]
+        account_uids = get_revolut_account_uids()
 
         results = []
 
         for uid in account_uids:
             response = requests.get(
                 f"{ENABLE_BANKING_API}/accounts/{uid}/details",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/json",
-                },
+                headers=headers,
                 timeout=30,
             )
 
             if response.status_code != 200:
                 results.append({
                     "ok": False,
-                    "http_status": response.status_code
+                    "http_status": response.status_code,
                 })
+
                 continue
 
             data = response.json()
@@ -168,38 +290,38 @@ def revolut_accounts():
                 "ok": True,
                 "name": data.get("name"),
                 "currency": data.get("currency"),
-                "cash_account_type": data.get("cash_account_type"),
+                "cash_account_type": data.get(
+                    "cash_account_type"
+                ),
             })
 
         return jsonify({
             "connected": True,
-            "accounts": results
+            "accounts": results,
         })
 
     except Exception as exc:
         return jsonify({
             "connected": False,
-            "error": type(exc).__name__
+            "error": type(exc).__name__,
         }), 500
+
+
+# ============================================================
+# DONNÉES REVOLUT BRUTES
+# ============================================================
 
 @app.get("/revolut/data")
 def revolut_data():
     try:
-        token = create_enable_banking_token()
+        headers = create_enable_banking_headers()
 
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-        }
-
-        account_uids = [
-            os.environ["REVOLUT_ACCOUNT_1_UID"],
-            os.environ["REVOLUT_ACCOUNT_2_UID"],
-        ]
+        account_uids = get_revolut_account_uids()
 
         accounts = []
 
         for uid in account_uids:
+
             # Informations du compte
             details_response = requests.get(
                 f"{ENABLE_BANKING_API}/accounts/{uid}/details",
@@ -227,14 +349,27 @@ def revolut_data():
                 details = {}
 
             if balances_response.status_code == 200:
-                balances = balances_response.json().get("balances", [])
+                balances = balances_response.json().get(
+                    "balances",
+                    [],
+                )
             else:
                 balances = []
 
             if transactions_response.status_code == 200:
-                transaction_data = transactions_response.json()
-                transactions = transaction_data.get("transactions", [])
-                continuation_key = transaction_data.get("continuation_key")
+                transaction_data = (
+                    transactions_response.json()
+                )
+
+                transactions = transaction_data.get(
+                    "transactions",
+                    [],
+                )
+
+                continuation_key = transaction_data.get(
+                    "continuation_key"
+                )
+
             else:
                 transactions = []
                 continuation_key = None
@@ -250,7 +385,9 @@ def revolut_data():
                 "http": {
                     "details": details_response.status_code,
                     "balances": balances_response.status_code,
-                    "transactions": transactions_response.status_code,
+                    "transactions": (
+                        transactions_response.status_code
+                    ),
                 },
             })
 
@@ -266,145 +403,181 @@ def revolut_data():
             "error": type(exc).__name__,
         }), 500
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
 
-def clean_amount(transaction):
-    amount_data = transaction.get("transaction_amount") or {}
-    try:
-        amount = float(amount_data.get("amount", 0))
-    except (TypeError, ValueError):
-        amount = 0.0
+# ============================================================
+# RÉSUMÉ REVOLUT POUR BUDGET BILLY
+# ============================================================
 
-    # Enable Banking donne souvent un montant positif
-    # + l'indicateur DBIT/CRDT séparément.
-    indicator = transaction.get("credit_debit_indicator")
-
-    if indicator == "DBIT":
-        amount = -abs(amount)
-    elif indicator == "CRDT":
-        amount = abs(amount)
-
-    return round(amount, 2)
-
-
-def transaction_name(transaction):
-    # Paiement : on privilégie le créancier/commerçant
-    creditor = transaction.get("creditor") or {}
-    debtor = transaction.get("debtor") or {}
-
-    name = creditor.get("name") or debtor.get("name")
-
-    if name:
-        return name
-
-    remittance = transaction.get("remittance_information")
-
-    if isinstance(remittance, list) and remittance:
-        return str(remittance[0])
-
-    if isinstance(remittance, str) and remittance:
-        return remittance
-
-    return "Transaction"
-
-
-@app.route("/revolut/summary")
+@app.get("/revolut/summary")
 def revolut_summary():
     try:
-        # On réutilise exactement les comptes déjà configurés
-        # dans production_session.json.
-        with open("production_session.json", "r", encoding="utf-8") as f:
-            session = json.load(f)
+        headers = create_enable_banking_headers()
 
-        accounts = session.get("accounts", [])
+        account_uids = get_revolut_account_uids()
 
         result = {
             "connected": True,
             "currency": "EUR",
             "total_balance": 0.0,
             "accounts": [],
-            "recent_transactions": []
+            "recent_transactions": [],
         }
 
-        for account in accounts:
-            uid = account["uid"]
+        for uid in account_uids:
 
-            balance_response = requests.get(
-                f"https://api.enablebanking.com/accounts/{uid}/balances",
-                headers=enable_banking_headers(),
-                timeout=30
+            # ------------------------------------------------
+            # DETAILS
+            # ------------------------------------------------
+
+            details_response = requests.get(
+                f"{ENABLE_BANKING_API}/accounts/{uid}/details",
+                headers=headers,
+                timeout=30,
             )
 
-            transaction_response = requests.get(
-                f"https://api.enablebanking.com/accounts/{uid}/transactions",
-                headers=enable_banking_headers(),
-                timeout=30
+            if details_response.status_code == 200:
+                details = details_response.json()
+            else:
+                details = {}
+
+            # ------------------------------------------------
+            # BALANCES
+            # ------------------------------------------------
+
+            balances_response = requests.get(
+                f"{ENABLE_BANKING_API}/accounts/{uid}/balances",
+                headers=headers,
+                timeout=30,
             )
 
-            balance = 0.0
+            if balances_response.status_code == 200:
+                balances = balances_response.json().get(
+                    "balances",
+                    [],
+                )
+            else:
+                balances = []
 
-            if balance_response.ok:
-                balances = balance_response.json().get("balances", [])
-
-                if balances:
-                    balance_data = balances[0].get("balance_amount") or {}
-
-                    try:
-                        balance = float(balance_data.get("amount", 0))
-                    except (TypeError, ValueError):
-                        balance = 0.0
-
-            account_type = account.get("cash_account_type")
+            balance = extract_balance(balances)
 
             result["accounts"].append({
-                "name": account.get("name"),
-                "type": account_type,
+                "name": details.get("name"),
+                "type": details.get("cash_account_type"),
                 "balance": round(balance, 2),
-                "currency": account.get("currency", "EUR")
+                "currency": details.get(
+                    "currency",
+                    "EUR",
+                ),
             })
 
             result["total_balance"] += balance
 
-            if transaction_response.ok:
-                transactions = transaction_response.json().get(
-                    "transactions", []
+            # ------------------------------------------------
+            # TRANSACTIONS
+            # ------------------------------------------------
+
+            transactions_response = requests.get(
+                f"{ENABLE_BANKING_API}/accounts/{uid}/transactions",
+                headers=headers,
+                timeout=30,
+            )
+
+            if transactions_response.status_code == 200:
+                transaction_data = (
+                    transactions_response.json()
+                )
+
+                transactions = transaction_data.get(
+                    "transactions",
+                    [],
                 )
 
                 for transaction in transactions:
-                    result["recent_transactions"].append({
-                        "date": (
-                            transaction.get("booking_date")
-                            or transaction.get("value_date")
-                            or transaction.get("transaction_date")
+
+                    date = (
+                        transaction.get("booking_date")
+                        or transaction.get("value_date")
+                        or transaction.get(
+                            "transaction_date"
+                        )
+                    )
+
+                    amount_data = (
+                        transaction.get(
+                            "transaction_amount"
+                        )
+                        or {}
+                    )
+
+                    result[
+                        "recent_transactions"
+                    ].append({
+                        "date": date,
+                        "merchant": transaction_name(
+                            transaction
                         ),
-                        "merchant": transaction_name(transaction),
-                        "amount": clean_amount(transaction),
-                        "currency": (
-                            transaction.get("transaction_amount") or {}
-                        ).get("currency", "EUR"),
-                        "status": transaction.get("status"),
-                        "reference": transaction.get("entry_reference")
+                        "amount": clean_amount(
+                            transaction
+                        ),
+                        "currency": amount_data.get(
+                            "currency",
+                            "EUR",
+                        ),
+                        "status": transaction.get(
+                            "status"
+                        ),
+                        "reference": transaction.get(
+                            "entry_reference"
+                        ),
                     })
 
-        result["total_balance"] = round(result["total_balance"], 2)
+        # ----------------------------------------------------
+        # TOTAL
+        # ----------------------------------------------------
 
-        # Plus récentes en premier
-        result["recent_transactions"].sort(
-            key=lambda x: x.get("date") or "",
-            reverse=True
+        result["total_balance"] = round(
+            result["total_balance"],
+            2,
         )
 
-        # Pour l'instant on garde seulement les 20 dernières
-        result["recent_transactions"] = result[
-            "recent_transactions"
-        ][:20]
+        # ----------------------------------------------------
+        # TRI DES TRANSACTIONS
+        # ----------------------------------------------------
+
+        result["recent_transactions"].sort(
+            key=lambda transaction: (
+                transaction.get("date") or ""
+            ),
+            reverse=True,
+        )
+
+        # Pour l'instant : 20 dernières opérations.
+        result["recent_transactions"] = (
+            result["recent_transactions"][:20]
+        )
 
         return jsonify(result)
 
-    except Exception as e:
+    except Exception as exc:
         return jsonify({
             "connected": False,
-            "error": type(e).__name__
+            "error": type(exc).__name__,
         }), 500
+
+
+# ============================================================
+# LANCEMENT LOCAL
+# ============================================================
+
+if __name__ == "__main__":
+    port = int(
+        os.environ.get(
+            "PORT",
+            8080,
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+    )
